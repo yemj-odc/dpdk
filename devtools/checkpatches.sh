@@ -102,20 +102,20 @@ check_forbidden_additions() { # <patch>
 		-f $(dirname $(readlink -f $0))/check-forbidden-tokens.awk \
 		"$1" || res=1
 
-	# refrain from using compiler __atomic_thread_fence()
+	# refrain from using compiler __rte_atomic_thread_fence()
 	# It should be avoided on x86 for SMP case.
 	awk -v FOLDERS="lib drivers app examples" \
-		-v EXPRESSIONS="__atomic_thread_fence\\\(" \
+		-v EXPRESSIONS="__rte_atomic_thread_fence\\\(" \
 		-v RET_ON_FAIL=1 \
-		-v MESSAGE='Using __atomic_thread_fence' \
+		-v MESSAGE='Using __rte_atomic_thread_fence, prefer rte_atomic_thread_fence' \
 		-f $(dirname $(readlink -f $0))/check-forbidden-tokens.awk \
 		"$1" || res=1
 
-	# refrain from using compiler __atomic_{add,and,nand,or,sub,xor}_fetch()
+	# refrain from using compiler __atomic_xxx builtins
 	awk -v FOLDERS="lib drivers app examples" \
-		-v EXPRESSIONS="__atomic_(add|and|nand|or|sub|xor)_fetch\\\(" \
+		-v EXPRESSIONS="__atomic_.*\\\(" \
 		-v RET_ON_FAIL=1 \
-		-v MESSAGE='Using __atomic_op_fetch, prefer __atomic_fetch_op' \
+		-v MESSAGE='Using __atomic_xxx built-ins, prefer rte_atomic_xxx' \
 		-f $(dirname $(readlink -f $0))/check-forbidden-tokens.awk \
 		"$1" || res=1
 
@@ -180,6 +180,14 @@ check_forbidden_additions() { # <patch>
 		-v EXPRESSIONS='include.*_driver\\.h include.*_pmd\\.h' \
 		-v RET_ON_FAIL=1 \
 		-v MESSAGE='Using driver specific headers in applications' \
+		-f $(dirname $(readlink -f $0))/check-forbidden-tokens.awk \
+		"$1" || res=1
+
+	# prevent addition of tests not in one of our test suites
+	awk -v FOLDERS='app/test' \
+		-v EXPRESSIONS='REGISTER_TEST_COMMAND' \
+		-v RET_ON_FAIL=1 \
+		-v MESSAGE='Using REGISTER_TEST_COMMAND instead of REGISTER_<suite_name>_TEST' \
 		-f $(dirname $(readlink -f $0))/check-forbidden-tokens.awk \
 		"$1" || res=1
 

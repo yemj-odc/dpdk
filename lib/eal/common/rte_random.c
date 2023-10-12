@@ -19,6 +19,7 @@ struct rte_rand_state {
 	uint64_t z3;
 	uint64_t z4;
 	uint64_t z5;
+	RTE_CACHE_GUARD;
 } __rte_cache_aligned;
 
 /* One instance each for every lcore id-equipped thread, and one
@@ -84,7 +85,7 @@ rte_srand(uint64_t seed)
 	unsigned int lcore_id;
 
 	/* add lcore_id to seed to avoid having the same sequence */
-	for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++)
+	for (lcore_id = 0; lcore_id < RTE_DIM(rand_states); lcore_id++)
 		__rte_srand_lfsr258(seed + lcore_id, &rand_states[lcore_id]);
 }
 

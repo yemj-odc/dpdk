@@ -5,13 +5,17 @@
 deps += ['cmdline', 'ring', 'mempool', 'mbuf']
 sources += files('commands.c', 'test.c')
 
+# optional dependencies: some files may use these - and so we should link them in -
+# but do not explicitly require them so they are not listed in the per-file lists below
+optional_deps = ['crypto_scheduler']
+
 # some other utility C files, providing functions used by various tests
 # so we need to include these deps in the dependency list for the files using those fns.
 packet_burst_generator_deps = ['net']
 sample_packet_forward_deps = ['net_ring', 'ethdev', 'bus_vdev']
 virtual_pmd_deps = ['ethdev', 'net', 'bus_pci']
 # test_cryptodev has material that other crypto tests need
-test_cryptodev_deps = ['bus_vdev', 'net', 'cryptodev', 'crypto_scheduler', 'security']
+test_cryptodev_deps = ['bus_vdev', 'net', 'cryptodev', 'security']
 
 source_file_deps = {
     # The C files providing functionality to other test cases
@@ -120,6 +124,7 @@ source_file_deps = {
     'test_meter.c': ['meter'],
     'test_metrics.c': ['metrics'],
     'test_mp_secondary.c': ['hash', 'lpm'],
+    'test_net_ether.c': ['net'],
     'test_pcapng.c': ['ethdev', 'net', 'pcapng'],
     'test_pdcp.c': ['eventdev', 'pdcp', 'net', 'timer', 'security'],
     'test_pdump.c': ['pdump'] + sample_packet_forward_deps,
@@ -224,6 +229,12 @@ foreach f, f_deps : source_file_deps
     endif
     if has_deps
         sources += files(f)
+    endif
+endforeach
+# add the optional dependencies
+foreach d:optional_deps
+    if is_variable(def_lib + '_rte_' + d) and d not in deps
+        deps += d
     endif
 endforeach
 

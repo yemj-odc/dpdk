@@ -3,34 +3,92 @@
  * All rights reserved.
  */
 
+#include "nfp_flow.h"
+
 #include <rte_flow_driver.h>
 #include <rte_hash.h>
 #include <rte_jhash.h>
-#include <bus_pci_driver.h>
 #include <rte_malloc.h>
 
-#include "nfp_common.h"
-#include "nfp_ctrl.h"
-#include "nfp_flow.h"
-#include "nfp_logs.h"
-#include "nfp_rxtx.h"
-#include "flower/nfp_flower.h"
-#include "flower/nfp_flower_cmsg.h"
-#include "flower/nfp_flower_ctrl.h"
+#include "flower/nfp_conntrack.h"
 #include "flower/nfp_flower_representor.h"
-#include "nfpcore/nfp_mip.h"
 #include "nfpcore/nfp_rtsym.h"
+#include "nfp_logs.h"
+#include "nfp_mtr.h"
 
-/*
- * Maximum number of items in struct rte_flow_action_vxlan_encap.
- * ETH / IPv4(6) / UDP / VXLAN / END
- */
-#define ACTION_VXLAN_ENCAP_ITEMS_NUM 5
+#define NFP_FLOWER_LAYER_EXT_META       RTE_BIT32(0)
+#define NFP_FLOWER_LAYER_PORT           RTE_BIT32(1)
+#define NFP_FLOWER_LAYER_MAC            RTE_BIT32(2)
+#define NFP_FLOWER_LAYER_TP             RTE_BIT32(3)
+#define NFP_FLOWER_LAYER_IPV4           RTE_BIT32(4)
+#define NFP_FLOWER_LAYER_IPV6           RTE_BIT32(5)
+#define NFP_FLOWER_LAYER_CT             RTE_BIT32(6)
+#define NFP_FLOWER_LAYER_VXLAN          RTE_BIT32(7)
 
-struct vxlan_data {
-	struct rte_flow_action_vxlan_encap conf;
-	struct rte_flow_item items[ACTION_VXLAN_ENCAP_ITEMS_NUM];
-};
+#define NFP_FLOWER_LAYER2_GRE           RTE_BIT32(0)
+#define NFP_FLOWER_LAYER2_QINQ          RTE_BIT32(4)
+#define NFP_FLOWER_LAYER2_GENEVE        RTE_BIT32(5)
+#define NFP_FLOWER_LAYER2_GENEVE_OP     RTE_BIT32(6)
+#define NFP_FLOWER_LAYER2_TUN_IPV6      RTE_BIT32(7)
+
+/* Compressed HW representation of TCP Flags */
+#define NFP_FL_TCP_FLAG_FIN             RTE_BIT32(0)
+#define NFP_FL_TCP_FLAG_SYN             RTE_BIT32(1)
+#define NFP_FL_TCP_FLAG_RST             RTE_BIT32(2)
+#define NFP_FL_TCP_FLAG_PSH             RTE_BIT32(3)
+#define NFP_FL_TCP_FLAG_URG             RTE_BIT32(4)
+
+#define NFP_FL_META_FLAG_MANAGE_MASK    RTE_BIT32(7)
+
+#define NFP_FLOWER_MASK_VLAN_CFI        RTE_BIT32(12)
+
+#define NFP_MASK_TABLE_ENTRIES          1024
+
+/* The maximum action list size (in bytes) supported by the NFP. */
+#define NFP_FL_MAX_A_SIZ                1216
+
+#define NFP_FL_SC_ACT_DROP      0x80000000
+#define NFP_FL_SC_ACT_USER      0x7D000000
+#define NFP_FL_SC_ACT_POPV      0x6A000000
+#define NFP_FL_SC_ACT_NULL      0x00000000
+
+/* GRE Tunnel flags */
+#define NFP_FL_GRE_FLAG_KEY         (1 << 2)
+
+/* Action opcodes */
+#define NFP_FL_ACTION_OPCODE_OUTPUT             0
+#define NFP_FL_ACTION_OPCODE_PUSH_VLAN          1
+#define NFP_FL_ACTION_OPCODE_POP_VLAN           2
+#define NFP_FL_ACTION_OPCODE_PUSH_MPLS          3
+#define NFP_FL_ACTION_OPCODE_POP_MPLS           4
+#define NFP_FL_ACTION_OPCODE_USERSPACE          5
+#define NFP_FL_ACTION_OPCODE_SET_TUNNEL         6
+#define NFP_FL_ACTION_OPCODE_SET_ETHERNET       7
+#define NFP_FL_ACTION_OPCODE_SET_MPLS           8
+#define NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS     9
+#define NFP_FL_ACTION_OPCODE_SET_IPV4_TTL_TOS   10
+#define NFP_FL_ACTION_OPCODE_SET_IPV6_SRC       11
+#define NFP_FL_ACTION_OPCODE_SET_IPV6_DST       12
+#define NFP_FL_ACTION_OPCODE_SET_IPV6_TC_HL_FL  13
+#define NFP_FL_ACTION_OPCODE_SET_UDP            14
+#define NFP_FL_ACTION_OPCODE_SET_TCP            15
+#define NFP_FL_ACTION_OPCODE_PRE_LAG            16
+#define NFP_FL_ACTION_OPCODE_PRE_TUNNEL         17
+#define NFP_FL_ACTION_OPCODE_PRE_GS             18
+#define NFP_FL_ACTION_OPCODE_GS                 19
+#define NFP_FL_ACTION_OPCODE_PUSH_NSH           20
+#define NFP_FL_ACTION_OPCODE_POP_NSH            21
+#define NFP_FL_ACTION_OPCODE_SET_QUEUE          22
+#define NFP_FL_ACTION_OPCODE_CONNTRACK          23
+#define NFP_FL_ACTION_OPCODE_METER              24
+#define NFP_FL_ACTION_OPCODE_CT_NAT_EXT         25
+#define NFP_FL_ACTION_OPCODE_PUSH_GENEVE        26
+#define NFP_FL_ACTION_OPCODE_NUM                32
+
+#define NFP_FL_OUT_FLAGS_LAST            RTE_BIT32(15)
+
+/* Tunnel ports */
+#define NFP_FL_PORT_TYPE_TUN            0x50000000
 
 /* Static initializer for a list of subsequent item types */
 #define NEXT_ITEM(...) \
@@ -252,13 +310,13 @@ nfp_check_mask_add(struct nfp_flow_priv *priv,
 		ret = nfp_mask_table_add(priv, mask_data, mask_len, mask_id);
 		if (ret != 0)
 			return false;
-
-		*meta_flags |= NFP_FL_META_FLAG_MANAGE_MASK;
 	} else {
 		/* mask entry already exist */
 		mask_entry->ref_cnt++;
 		*mask_id = mask_entry->mask_id;
 	}
+
+	*meta_flags |= NFP_FL_META_FLAG_MANAGE_MASK;
 
 	return true;
 }
@@ -338,6 +396,48 @@ nfp_flow_table_search(struct nfp_flow_priv *priv,
 	return flow_find;
 }
 
+int
+nfp_flow_table_add_merge(struct nfp_flow_priv *priv,
+		struct rte_flow *nfp_flow)
+{
+	struct rte_flow *flow_find;
+
+	flow_find = nfp_flow_table_search(priv, nfp_flow);
+	if (flow_find != NULL) {
+		if (nfp_flow->merge_flag || flow_find->merge_flag) {
+			flow_find->merge_flag = true;
+			flow_find->ref_cnt++;
+			return 0;
+		}
+
+		PMD_DRV_LOG(ERR, "Add to flow table failed.");
+		return -EINVAL;
+	}
+
+	return nfp_flow_table_add(priv, nfp_flow);
+}
+
+static int
+nfp_flow_table_delete_merge(struct nfp_flow_priv *priv,
+		struct rte_flow *nfp_flow)
+{
+	struct rte_flow *flow_find;
+
+	flow_find = nfp_flow_table_search(priv, nfp_flow);
+	if (flow_find == NULL) {
+		PMD_DRV_LOG(ERR, "Can't delete a non-existing flow.");
+		return -EINVAL;
+	}
+
+	if (nfp_flow->merge_flag || flow_find->merge_flag) {
+		flow_find->ref_cnt--;
+		if (flow_find->ref_cnt > 0)
+			return 0;
+	}
+
+	return nfp_flow_table_delete(priv, nfp_flow);
+}
+
 static struct rte_flow *
 nfp_flow_alloc(struct nfp_fl_key_ls *key_layer, uint32_t port_id)
 {
@@ -372,7 +472,7 @@ exit:
 	return NULL;
 }
 
-static void
+void
 nfp_flow_free(struct rte_flow *nfp_flow)
 {
 	rte_free(nfp_flow->payload.meta);
@@ -653,7 +753,8 @@ static void
 nfp_flow_compile_metadata(struct nfp_flow_priv *priv,
 		struct rte_flow *nfp_flow,
 		struct nfp_fl_key_ls *key_layer,
-		uint32_t stats_ctx)
+		uint32_t stats_ctx,
+		uint64_t cookie)
 {
 	struct nfp_fl_rule_metadata *nfp_flow_meta;
 	char *mbuf_off_exact;
@@ -669,7 +770,7 @@ nfp_flow_compile_metadata(struct nfp_flow_priv *priv,
 	nfp_flow_meta->act_len      = key_layer->act_size >> NFP_FL_LW_SIZ;
 	nfp_flow_meta->flags        = 0;
 	nfp_flow_meta->host_ctx_id  = rte_cpu_to_be_32(stats_ctx);
-	nfp_flow_meta->host_cookie  = rte_rand();
+	nfp_flow_meta->host_cookie  = rte_cpu_to_be_64(cookie);
 	nfp_flow_meta->flow_version = rte_cpu_to_be_64(priv->flower_version);
 
 	mbuf_off_exact = nfp_flow->payload.unmasked_data;
@@ -1022,6 +1123,9 @@ nfp_flow_key_layers_calculate_actions(const struct rte_flow_action actions[],
 				PMD_DRV_LOG(ERR, "Only support one meter action.");
 				return -ENOTSUP;
 			}
+			break;
+		case RTE_FLOW_ACTION_TYPE_CONNTRACK:
+			PMD_DRV_LOG(DEBUG, "RTE_FLOW_ACTION_TYPE_CONNTRACK detected");
 			break;
 		default:
 			PMD_DRV_LOG(ERR, "Action type %d not supported.", action->type);
@@ -1890,7 +1994,7 @@ nfp_flow_is_tun_item(const struct rte_flow_item *item)
 	return false;
 }
 
-static bool
+bool
 nfp_flow_inner_item_get(const struct rte_flow_item items[],
 		const struct rte_flow_item **inner_item)
 {
@@ -3567,6 +3671,9 @@ nfp_flow_compile_action(struct nfp_flower_representor *representor,
 				return -EINVAL;
 			position += sizeof(struct nfp_fl_act_meter);
 			break;
+		case RTE_FLOW_ACTION_TYPE_CONNTRACK:
+			PMD_DRV_LOG(DEBUG, "Process RTE_FLOW_ACTION_TYPE_CONNTRACK");
+			break;
 		default:
 			PMD_DRV_LOG(ERR, "Unsupported action type: %d", action->type);
 			return -ENOTSUP;
@@ -3582,11 +3689,14 @@ nfp_flow_compile_action(struct nfp_flower_representor *representor,
 	return 0;
 }
 
-static struct rte_flow *
+struct rte_flow *
 nfp_flow_process(struct nfp_flower_representor *representor,
 		const struct rte_flow_item items[],
 		const struct rte_flow_action actions[],
-		bool validate_flag)
+		bool validate_flag,
+		uint64_t cookie,
+		bool install_flag,
+		bool merge_flag)
 {
 	int ret;
 	char *hash_data;
@@ -3622,9 +3732,10 @@ nfp_flow_process(struct nfp_flower_representor *representor,
 		goto free_stats;
 	}
 
-	nfp_flow->install_flag = true;
+	nfp_flow->install_flag = install_flag;
+	nfp_flow->merge_flag = merge_flag;
 
-	nfp_flow_compile_metadata(priv, nfp_flow, &key_layer, stats_ctx);
+	nfp_flow_compile_metadata(priv, nfp_flow, &key_layer, stats_ctx, cookie);
 
 	ret = nfp_flow_compile_items(representor, items, nfp_flow);
 	if (ret != 0) {
@@ -3656,7 +3767,7 @@ nfp_flow_process(struct nfp_flower_representor *representor,
 
 	/* Find the flow in hash table */
 	flow_find = nfp_flow_table_search(priv, nfp_flow);
-	if (flow_find != NULL) {
+	if (flow_find != NULL && !nfp_flow->merge_flag && !flow_find->merge_flag) {
 		PMD_DRV_LOG(ERR, "This flow is already exist.");
 		if (!nfp_check_mask_remove(priv, mask_data, mask_len,
 				&nfp_flow_meta->flags)) {
@@ -3687,6 +3798,10 @@ nfp_flow_setup(struct nfp_flower_representor *representor,
 		__rte_unused struct rte_flow_error *error,
 		bool validate_flag)
 {
+	uint64_t cookie;
+	const struct rte_flow_item *item;
+	const struct rte_flow_item *ct_item = NULL;
+
 	if (attr->group != 0)
 		PMD_DRV_LOG(INFO, "Pretend we support group attribute.");
 
@@ -3696,10 +3811,23 @@ nfp_flow_setup(struct nfp_flower_representor *representor,
 	if (attr->transfer != 0)
 		PMD_DRV_LOG(INFO, "Pretend we support transfer attribute.");
 
-	return nfp_flow_process(representor, items, actions, validate_flag);
+	for (item = items; item->type != RTE_FLOW_ITEM_TYPE_END; ++item) {
+		if (item->type == RTE_FLOW_ITEM_TYPE_CONNTRACK) {
+			ct_item = item;
+			break;
+		}
+	}
+
+	cookie = rte_rand();
+
+	if (ct_item != NULL)
+		return nfp_ct_flow_setup(representor, items, actions,
+				ct_item, validate_flag, cookie);
+
+	return nfp_flow_process(representor, items, actions, validate_flag, cookie, true, false);
 }
 
-static int
+int
 nfp_flow_teardown(struct nfp_flow_priv *priv,
 		struct rte_flow *nfp_flow,
 		bool validate_flag)
@@ -3799,7 +3927,7 @@ nfp_flow_create(struct rte_eth_dev *dev,
 	}
 
 	/* Add the flow to flow hash table */
-	ret = nfp_flow_table_add(priv, nfp_flow);
+	ret = nfp_flow_table_add_merge(priv, nfp_flow);
 	if (ret != 0) {
 		rte_flow_error_set(error, EINVAL, RTE_FLOW_ERROR_TYPE_UNSPECIFIED,
 				NULL, "Add flow to the flow table failed.");
@@ -3827,20 +3955,28 @@ flow_teardown:
 	return NULL;
 }
 
-static int
+int
 nfp_flow_destroy(struct rte_eth_dev *dev,
 		struct rte_flow *nfp_flow,
 		struct rte_flow_error *error)
 {
 	int ret;
+	uint64_t cookie;
 	struct rte_flow *flow_find;
 	struct nfp_flow_priv *priv;
+	struct nfp_ct_map_entry *me;
 	struct nfp_app_fw_flower *app_fw_flower;
 	struct nfp_flower_representor *representor;
 
 	representor = dev->data->dev_private;
 	app_fw_flower = representor->app_fw_flower;
 	priv = app_fw_flower->flow_priv;
+
+	/* Find the flow in ct_map_table */
+	cookie = rte_be_to_cpu_64(nfp_flow->payload.meta->host_cookie);
+	me = nfp_ct_map_table_search(priv, (char *)&cookie, sizeof(uint64_t));
+	if (me != NULL)
+		return nfp_ct_offload_del(dev, me, error);
 
 	/* Find the flow in flow hash table */
 	flow_find = nfp_flow_table_search(priv, nfp_flow);
@@ -3902,7 +4038,7 @@ nfp_flow_destroy(struct rte_eth_dev *dev,
 	}
 
 	/* Delete the flow from flow hash table */
-	ret = nfp_flow_table_delete(priv, nfp_flow);
+	ret = nfp_flow_table_delete_merge(priv, nfp_flow);
 	if (ret != 0) {
 		rte_flow_error_set(error, EINVAL, RTE_FLOW_ERROR_TYPE_UNSPECIFIED,
 				NULL, "Delete flow from the flow table failed.");
@@ -3961,10 +4097,12 @@ nfp_flow_stats_get(struct rte_eth_dev *dev,
 		void *data)
 {
 	bool reset;
+	uint64_t cookie;
 	uint32_t ctx_id;
 	struct rte_flow *flow;
 	struct nfp_flow_priv *priv;
 	struct nfp_fl_stats *stats;
+	struct nfp_ct_map_entry *me;
 	struct rte_flow_query_count *query;
 
 	priv = nfp_flow_dev_to_priv(dev);
@@ -3978,8 +4116,15 @@ nfp_flow_stats_get(struct rte_eth_dev *dev,
 	reset = query->reset;
 	memset(query, 0, sizeof(*query));
 
-	ctx_id = rte_be_to_cpu_32(nfp_flow->payload.meta->host_ctx_id);
-	stats = &priv->stats[ctx_id];
+	/* Find the flow in ct_map_table */
+	cookie = rte_be_to_cpu_64(nfp_flow->payload.meta->host_cookie);
+	me = nfp_ct_map_table_search(priv, (char *)&cookie, sizeof(uint64_t));
+	if (me != NULL) {
+		stats = nfp_ct_flow_stats_get(priv, me);
+	} else {
+		ctx_id = rte_be_to_cpu_32(nfp_flow->payload.meta->host_ctx_id);
+		stats = &priv->stats[ctx_id];
+	}
 
 	rte_spinlock_lock(&priv->stats_lock);
 	if (stats->pkts != 0 && stats->bytes != 0) {
@@ -4171,6 +4316,23 @@ nfp_flow_priv_init(struct nfp_pf_dev *pf_dev)
 		.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
 	};
 
+	struct rte_hash_parameters ct_zone_hash_params = {
+		.name       = "ct_zone_table",
+		.entries    = 65536,
+		.hash_func  = rte_jhash,
+		.socket_id  = rte_socket_id(),
+		.key_len    = sizeof(uint32_t),
+		.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
+	};
+
+	struct rte_hash_parameters ct_map_hash_params = {
+		.name       = "ct_map_table",
+		.hash_func  = rte_jhash,
+		.socket_id  = rte_socket_id(),
+		.key_len    = sizeof(uint32_t),
+		.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
+	};
+
 	ctx_count = nfp_rtsym_read_le(pf_dev->sym_tbl,
 			"CONFIG_FC_HOST_CTX_COUNT", &ret);
 	if (ret < 0) {
@@ -4261,6 +4423,25 @@ nfp_flow_priv_init(struct nfp_pf_dev *pf_dev)
 		goto free_flow_table;
 	}
 
+	/* ct zone table */
+	ct_zone_hash_params.hash_func_init_val = priv->hash_seed;
+	priv->ct_zone_table = rte_hash_create(&ct_zone_hash_params);
+	if (priv->ct_zone_table == NULL) {
+		PMD_INIT_LOG(ERR, "ct zone table creation failed");
+		ret = -ENOMEM;
+		goto free_pre_tnl_table;
+	}
+
+	/* ct map table */
+	ct_map_hash_params.hash_func_init_val = priv->hash_seed;
+	ct_map_hash_params.entries = ctx_count;
+	priv->ct_map_table = rte_hash_create(&ct_map_hash_params);
+	if (priv->ct_map_table == NULL) {
+		PMD_INIT_LOG(ERR, "ct map table creation failed");
+		ret = -ENOMEM;
+		goto free_ct_zone_table;
+	}
+
 	/* ipv4 off list */
 	rte_spinlock_init(&priv->ipv4_off_lock);
 	LIST_INIT(&priv->ipv4_off_list);
@@ -4274,6 +4455,10 @@ nfp_flow_priv_init(struct nfp_pf_dev *pf_dev)
 
 	return 0;
 
+free_ct_zone_table:
+	rte_hash_free(priv->ct_zone_table);
+free_pre_tnl_table:
+	rte_hash_free(priv->pre_tun_table);
 free_flow_table:
 	rte_hash_free(priv->flow_table);
 free_mask_table:
@@ -4299,6 +4484,8 @@ nfp_flow_priv_uninit(struct nfp_pf_dev *pf_dev)
 	app_fw_flower = NFP_PRIV_TO_APP_FW_FLOWER(pf_dev->app_fw_priv);
 	priv = app_fw_flower->flow_priv;
 
+	rte_hash_free(priv->ct_map_table);
+	rte_hash_free(priv->ct_zone_table);
 	rte_hash_free(priv->pre_tun_table);
 	rte_hash_free(priv->flow_table);
 	rte_hash_free(priv->mask_table);

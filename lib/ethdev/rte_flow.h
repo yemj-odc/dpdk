@@ -129,6 +129,12 @@ struct rte_flow_attr {
 	uint32_t reserved:29; /**< Reserved, must be zero. */
 };
 
+struct rte_flow_group_attr {
+	uint32_t ingress:1;
+	uint32_t egress:1;
+	uint32_t transfer:1;
+};
+
 /**
  * Matching pattern item types.
  *
@@ -688,6 +694,14 @@ enum rte_flow_item_type {
 	 * @see struct rte_flow_item_ib_bth.
 	 */
 	RTE_FLOW_ITEM_TYPE_IB_BTH,
+
+	/**
+	 * Matches the packet type as defined in rte_mbuf_ptype.
+	 *
+	 * See struct rte_flow_item_ptype.
+	 *
+	 */
+	RTE_FLOW_ITEM_TYPE_PTYPE,
 };
 
 /**
@@ -2304,6 +2318,23 @@ static const struct rte_flow_item_tx_queue rte_flow_item_tx_queue_mask = {
 #endif
 
 /**
+ *
+ * RTE_FLOW_ITEM_TYPE_PTYPE
+ *
+ * Matches the packet type as defined in rte_mbuf_ptype.
+ */
+struct rte_flow_item_ptype {
+	uint32_t packet_type; /**< L2/L3/L4 and tunnel information. */
+};
+
+/** Default mask for RTE_FLOW_ITEM_TYPE_PTYPE. */
+#ifndef __cplusplus
+static const struct rte_flow_item_ptype rte_flow_item_ptype_mask = {
+	.packet_type = 0xffffffff,
+};
+#endif
+
+/**
  * Action types.
  *
  * Each possible action is represented by a type.
@@ -2981,6 +3012,15 @@ enum rte_flow_action_type {
 	 * @see struct rte_flow_action_indirect_list
 	 */
 	RTE_FLOW_ACTION_TYPE_INDIRECT_LIST,
+
+	/**
+	 * Program action. These actions are defined by the program currently
+	 * loaded on the device. For example, these actions are applicable to
+	 * devices that can be programmed through the P4 language.
+	 *
+	 * @see struct rte_flow_action_prog.
+	 */
+	RTE_FLOW_ACTION_TYPE_PROG,
 };
 
 /**
@@ -3196,6 +3236,13 @@ enum rte_eth_hash_function {
 	 * src or dst address will xor with zero pair.
 	 */
 	RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ,
+	/**
+	 * Symmetric Toeplitz: L3 and L4 fields are sorted prior to
+	 * the hash function.
+	 *  If src_ip > dst_ip, swap src_ip and dst_ip.
+	 *  If src_port > dst_port, swap src_port and dst_port.
+	 */
+	RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ_SORT,
 	RTE_ETH_HASH_FUNCTION_MAX,
 };
 
@@ -4053,6 +4100,48 @@ struct rte_flow_update_meter_mark {
 struct rte_flow_indirect_update_flow_meter_mark {
 	/** Updated init color applied to packet */
 	enum rte_color init_color;
+};
+
+/**
+ * @warning
+ * @b EXPERIMENTAL: this structure may change without prior notice.
+ *
+ * Program action argument configuration parameters.
+ *
+ * For each action argument, its *size* must be non-zero and its *value* must
+ * point to a valid array of *size* bytes specified in network byte order.
+ *
+ * @see struct rte_flow_action_prog
+ */
+struct rte_flow_action_prog_argument {
+	/** Argument name. */
+	const char *name;
+	/** Argument size in bytes. */
+	uint32_t size;
+	/** Argument value. */
+	const uint8_t *value;
+};
+
+/**
+ * @warning
+ * @b EXPERIMENTAL: this structure may change without prior notice.
+ *
+ * RTE_FLOW_ACTION_TYPE_PROG
+ *
+ * Program action configuration parameters.
+ *
+ * Each action can have zero or more arguments. When *args_num* is non-zero, the
+ * *args* parameter must point to a valid array of *args_num* elements.
+ *
+ * @see RTE_FLOW_ACTION_TYPE_PROG
+ */
+struct rte_flow_action_prog {
+	/** Action name. */
+	const char *name;
+	/** Number of action arguments. */
+	uint32_t args_num;
+	/** Action arguments array. */
+	const struct rte_flow_action_prog_argument *args;
 };
 
 /* Mbuf dynamic field offset for metadata. */
@@ -5827,6 +5916,35 @@ int
 rte_flow_template_table_destroy(uint16_t port_id,
 		struct rte_flow_template_table *template_table,
 		struct rte_flow_error *error);
+
+/**
+ * @warning
+ * @b EXPERIMENTAL: this API may change without prior notice.
+ *
+ * Set group miss actions.
+ *
+ * @param port_id
+ *   Port identifier of Ethernet device.
+ * @param group_id
+ *   Identifier of a group to set miss actions for.
+ * @param attr
+ *   Group attributes.
+ * @param actions
+ *   List of group miss actions.
+ * @param[out] error
+ *   Perform verbose error reporting if not NULL.
+ *   PMDs initialize this structure in case of error only.
+ *
+ * @return
+ *   0 on success, a negative errno value otherwise and rte_errno is set.
+ */
+__rte_experimental
+int
+rte_flow_group_set_miss_actions(uint16_t port_id,
+				uint32_t group_id,
+				const struct rte_flow_group_attr *attr,
+				const struct rte_flow_action actions[],
+				struct rte_flow_error *error);
 
 /**
  * @warning

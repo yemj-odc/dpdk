@@ -3,16 +3,100 @@
  * All rights reserved.
  */
 
-#include <ethdev_driver.h>
+#include "nfp_nfd3.h"
+
 #include <bus_pci_driver.h>
 #include <rte_malloc.h>
 
-#include "../nfp_logs.h"
-#include "../nfp_common.h"
-#include "../nfp_rxtx.h"
 #include "../flower/nfp_flower.h"
-#include "../flower/nfp_flower_cmsg.h"
-#include "nfp_nfd3.h"
+#include "../nfp_logs.h"
+
+/* Flags in the host TX descriptor */
+#define NFD3_DESC_TX_CSUM               RTE_BIT32(7)
+#define NFD3_DESC_TX_IP4_CSUM           RTE_BIT32(6)
+#define NFD3_DESC_TX_TCP_CSUM           RTE_BIT32(5)
+#define NFD3_DESC_TX_UDP_CSUM           RTE_BIT32(4)
+#define NFD3_DESC_TX_VLAN               RTE_BIT32(3)
+#define NFD3_DESC_TX_LSO                RTE_BIT32(2)
+#define NFD3_DESC_TX_ENCAP              RTE_BIT32(1)
+#define NFD3_DESC_TX_O_IP4_CSUM         RTE_BIT32(0)
+
+/* Set NFD3 TX descriptor for TSO */
+static void
+nfp_net_nfd3_tx_tso(struct nfp_net_txq *txq,
+		struct nfp_net_nfd3_tx_desc *txd,
+		struct rte_mbuf *mb)
+{
+	uint64_t ol_flags;
+	struct nfp_net_hw *hw = txq->hw;
+
+	if ((hw->cap & NFP_NET_CFG_CTRL_LSO_ANY) == 0)
+		goto clean_txd;
+
+	ol_flags = mb->ol_flags;
+	if ((ol_flags & RTE_MBUF_F_TX_TCP_SEG) == 0)
+		goto clean_txd;
+
+	txd->l3_offset = mb->l2_len;
+	txd->l4_offset = mb->l2_len + mb->l3_len;
+	txd->lso_hdrlen = mb->l2_len + mb->l3_len + mb->l4_len;
+
+	if ((ol_flags & RTE_MBUF_F_TX_TUNNEL_MASK) != 0) {
+		txd->l3_offset += mb->outer_l2_len + mb->outer_l3_len;
+		txd->l4_offset += mb->outer_l2_len + mb->outer_l3_len;
+		txd->lso_hdrlen += mb->outer_l2_len + mb->outer_l3_len;
+	}
+
+	txd->mss = rte_cpu_to_le_16(mb->tso_segsz);
+	txd->flags = NFD3_DESC_TX_LSO;
+
+	return;
+
+clean_txd:
+	txd->flags = 0;
+	txd->l3_offset = 0;
+	txd->l4_offset = 0;
+	txd->lso_hdrlen = 0;
+	txd->mss = 0;
+}
+
+/* Set TX CSUM offload flags in NFD3 TX descriptor */
+static void
+nfp_net_nfd3_tx_cksum(struct nfp_net_txq *txq,
+		struct nfp_net_nfd3_tx_desc *txd,
+		struct rte_mbuf *mb)
+{
+	uint64_t ol_flags;
+	struct nfp_net_hw *hw = txq->hw;
+
+	if ((hw->cap & NFP_NET_CFG_CTRL_TXCSUM) == 0)
+		return;
+
+	ol_flags = mb->ol_flags;
+
+	/* Set TCP csum offload if TSO enabled. */
+	if ((ol_flags & RTE_MBUF_F_TX_TCP_SEG) != 0)
+		txd->flags |= NFD3_DESC_TX_TCP_CSUM;
+
+	/* IPv6 does not need checksum */
+	if ((ol_flags & RTE_MBUF_F_TX_IP_CKSUM) != 0)
+		txd->flags |= NFD3_DESC_TX_IP4_CSUM;
+
+	if ((ol_flags & RTE_MBUF_F_TX_TUNNEL_MASK) != 0)
+		txd->flags |= NFD3_DESC_TX_ENCAP;
+
+	switch (ol_flags & RTE_MBUF_F_TX_L4_MASK) {
+	case RTE_MBUF_F_TX_UDP_CKSUM:
+		txd->flags |= NFD3_DESC_TX_UDP_CSUM;
+		break;
+	case RTE_MBUF_F_TX_TCP_CKSUM:
+		txd->flags |= NFD3_DESC_TX_TCP_CSUM;
+		break;
+	}
+
+	if ((ol_flags & (RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_L4_MASK)) != 0)
+		txd->flags |= NFD3_DESC_TX_CSUM;
+}
 
 uint32_t
 nfp_flower_nfd3_pkt_add_metadata(struct rte_mbuf *mbuf,
@@ -63,10 +147,13 @@ nfp_net_nfd3_set_meta_data(struct nfp_net_meta_raw *meta_data,
 	char *meta;
 	uint8_t layer = 0;
 	uint32_t meta_info;
+	uint32_t cap_extend;
 	struct nfp_net_hw *hw;
 	uint8_t vlan_layer = 0;
+	uint8_t ipsec_layer = 0;
 
 	hw = txq->hw;
+	cap_extend = nn_cfg_readl(hw, NFP_NET_CFG_CAP_WORD1);
 
 	if ((pkt->ol_flags & RTE_MBUF_F_TX_VLAN) != 0 &&
 			(hw->ctrl & NFP_NET_CFG_CTRL_TXVLAN_V2) != 0) {
@@ -74,6 +161,18 @@ nfp_net_nfd3_set_meta_data(struct nfp_net_meta_raw *meta_data,
 			meta_data->length = NFP_NET_META_HEADER_SIZE;
 		meta_data->length += NFP_NET_META_FIELD_SIZE;
 		meta_data->header |= NFP_NET_META_VLAN;
+	}
+
+	if ((pkt->ol_flags & RTE_MBUF_F_TX_SEC_OFFLOAD) != 0 &&
+			(cap_extend & NFP_NET_CFG_CTRL_IPSEC) != 0) {
+		uint32_t ipsec_type = NFP_NET_META_IPSEC |
+				NFP_NET_META_IPSEC << NFP_NET_META_FIELD_SIZE |
+				NFP_NET_META_IPSEC << (2 * NFP_NET_META_FIELD_SIZE);
+		if (meta_data->length == 0)
+			meta_data->length = NFP_NET_META_FIELD_SIZE;
+		uint8_t ipsec_offset = meta_data->length - NFP_NET_META_FIELD_SIZE;
+		meta_data->header |= (ipsec_type << ipsec_offset);
+		meta_data->length += 3 * NFP_NET_META_FIELD_SIZE;
 	}
 
 	if (meta_data->length == 0)
@@ -95,6 +194,15 @@ nfp_net_nfd3_set_meta_data(struct nfp_net_meta_raw *meta_data,
 			}
 			nfp_net_set_meta_vlan(meta_data, pkt, layer);
 			vlan_layer++;
+			break;
+		case NFP_NET_META_IPSEC:
+			if (ipsec_layer > 2) {
+				PMD_DRV_LOG(ERR, "At most 3 layers of ipsec is supported for now.");
+				return;
+			}
+
+			nfp_net_set_meta_ipsec(meta_data, txq, pkt, layer, ipsec_layer);
+			ipsec_layer++;
 			break;
 		default:
 			PMD_DRV_LOG(ERR, "The metadata type not supported");
@@ -262,7 +370,6 @@ nfp_net_nfd3_tx_queue_setup(struct rte_eth_dev *dev,
 		unsigned int socket_id,
 		const struct rte_eth_txconf *tx_conf)
 {
-	int ret;
 	size_t size;
 	uint32_t tx_desc_sz;
 	uint16_t min_tx_desc;
@@ -276,9 +383,7 @@ nfp_net_nfd3_tx_queue_setup(struct rte_eth_dev *dev,
 
 	PMD_INIT_FUNC_TRACE();
 
-	ret = nfp_net_tx_desc_limits(hw, &min_tx_desc, &max_tx_desc);
-	if (ret != 0)
-		return ret;
+	nfp_net_tx_desc_limits(hw, &min_tx_desc, &max_tx_desc);
 
 	/* Validating number of descriptors */
 	tx_desc_sz = nb_desc * sizeof(struct nfp_net_nfd3_tx_desc);

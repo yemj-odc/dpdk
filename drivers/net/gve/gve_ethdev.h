@@ -15,16 +15,13 @@
 /* TODO: this is a workaround to ensure that Tx complq is enough */
 #define DQO_TX_MULTIPLIER 4
 
-#define GVE_DEFAULT_RX_FREE_THRESH  512
+#define GVE_DEFAULT_RX_FREE_THRESH   64
 #define GVE_DEFAULT_TX_FREE_THRESH   32
 #define GVE_DEFAULT_TX_RS_THRESH     32
 #define GVE_TX_MAX_FREE_SZ          512
 
 #define GVE_MIN_BUF_SIZE	    1024
 #define GVE_MAX_RX_PKTLEN	    65535
-
-#define GVE_MAX_MTU	RTE_ETHER_MTU
-#define GVE_MIN_MTU	RTE_ETHER_MIN_MTU
 
 #define GVE_TX_CKSUM_OFFLOAD_MASK (		\
 		RTE_MBUF_F_TX_L4_MASK  |	\

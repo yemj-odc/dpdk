@@ -3514,6 +3514,33 @@ port_queue_flow_pull(portid_t port_id, queueid_t queue_id)
 	return ret;
 }
 
+/* Set group miss actions */
+int
+port_queue_group_set_miss_actions(portid_t port_id, const struct rte_flow_attr *attr,
+				  const struct rte_flow_action *actions)
+{
+	struct rte_flow_group_attr gattr = {
+		.ingress = attr->ingress,
+		.egress = attr->egress,
+		.transfer = attr->transfer,
+	};
+	struct rte_flow_error error;
+	int ret = 0;
+
+	if (port_id_is_invalid(port_id, ENABLED_WARN) ||
+	    port_id == (portid_t)RTE_PORT_ALL)
+		return -EINVAL;
+
+	memset(&error, 0x66, sizeof(error));
+	ret = rte_flow_group_set_miss_actions(port_id, attr->group, &gattr, actions, &error);
+
+	if (ret < 0)
+		return port_flow_complain(&error);
+
+	printf("Group #%u set miss actions succeeded\n", attr->group);
+	return ret;
+}
+
 /** Create flow rule. */
 int
 port_flow_create(portid_t port_id,
@@ -6800,6 +6827,24 @@ mcast_addr_remove(portid_t port_id, struct rte_ether_addr *mc_addr)
 	if (eth_port_multicast_addr_list_set(port_id) < 0)
 		/* Rollback on failure, add the address back into the pool */
 		mcast_addr_pool_append(port, mc_addr);
+}
+
+void
+mcast_addr_flush(portid_t port_id)
+{
+	int ret;
+
+	if (port_id_is_invalid(port_id, ENABLED_WARN))
+		return;
+
+	ret = rte_eth_dev_set_mc_addr_list(port_id, NULL, 0);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Failed to flush all multicast MAC addresses on port_id %u\n",
+			port_id);
+		return;
+	}
+	mcast_addr_pool_destroy(port_id);
 }
 
 void
